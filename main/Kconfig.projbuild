@@ -1,0 +1,48 @@
+menu "Hip Dash hardware"
+
+config HIP_I2C_SDA_GPIO
+    int "OLED I2C SDA GPIO"
+    default 4
+    range 0 30
+    help
+        GPIO connected to the OLED SDA pin.
+
+config HIP_I2C_SCL_GPIO
+    int "OLED I2C SCL GPIO"
+    default 5
+    range 0 30
+    help
+        GPIO connected to the OLED SCL pin.
+
+config HIP_OLED_I2C_ADDRESS
+    hex "OLED I2C address"
+    default 0x3C
+    help
+        Common 128x64 OLED modules use 0x3C. Some boards use 0x3D.
+
+config HIP_OLED_COLUMN_OFFSET
+    int "OLED column offset"
+    default 0
+    range 0 4
+    help
+        Use 0 for most SSD1306 modules. Try 2 for SH1106-style 128x64 modules.
+
+config HIP_BUTTON_GPIO
+    int "Jump button GPIO"
+    default 9
+    range 0 30
+    help
+        GPIO connected to the button input. The firmware enables the internal pull-up.
+
+config HIP_BUTTON_ACTIVE_LOW
+    bool "Button connects GPIO to GND when pressed"
+    default y
+
+config HIP_BUTTON_LED_GPIO
+    int "Button LED GPIO"
+    default 8
+    range -1 30
+    help
+        GPIO connected to the button LED. Use -1 to disable the LED output.
+
+endmenu
