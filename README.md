@@ -1,4 +1,4 @@
-# Hip Dash
+# Laura Dino Run
 
 Kleines Geometry-Dash-aehnliches Jump-and-Dodge-Spiel fuer:
 
@@ -10,6 +10,7 @@ Das Projekt ist ein ESP-IDF-Projekt ohne externe Libraries. Das OLED wird direkt
 
 ## Spiel
 
+- Beim Einschalten laeuft ein animierter Splash Screen.
 - Ein kurzer Tastendruck startet das Spiel.
 - Jeder Tastendruck laesst die Spielfigur springen.
 - Hindernisse kommen von rechts nach links.
@@ -71,7 +72,7 @@ Falls das Board nicht automatisch in den Bootloader wechselt, halte beim Start d
 Die Hardwarewerte findest du in `menuconfig` unter:
 
 ```text
-Hip Dash hardware
+Laura Dino Run hardware
 ```
 
 ## Wichtige Dateien

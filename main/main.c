@@ -26,9 +26,11 @@
 #define OLED_COL_OFFSET CONFIG_HIP_OLED_COLUMN_OFFSET
 #define BUTTON_GPIO CONFIG_HIP_BUTTON_GPIO
 #define BUTTON_LED_GPIO CONFIG_HIP_BUTTON_LED_GPIO
+#define SPLASH_DURATION_US 3200000LL
 
-static const char *TAG = "hip_dash";
-static const char *NVS_NAMESPACE = "hip_dash";
+static const char *TAG = "laura_dino_run";
+static const char *NVS_NAMESPACE = "laura_dino_run";
+static const char *NVS_LEGACY_NAMESPACE = "hip_dash";
 static const char *NVS_HIGH_SCORE_KEY = "high_score";
 static uint8_t fb[OLED_WIDTH * OLED_PAGES];
 static i2c_master_bus_handle_t i2c_bus;
@@ -257,6 +259,21 @@ static void text(int x, int y, const char *s)
     }
 }
 
+static void text_scaled(int x, int y, const char *s, int scale)
+{
+    while (*s) {
+        const uint8_t *g = glyph(*s++);
+        for (int col = 0; col < 5; col++) {
+            for (int row = 0; row < 7; row++) {
+                if (g[col] & (1U << row)) {
+                    fill_rect(x + col * scale, y + row * scale, scale, scale);
+                }
+            }
+        }
+        x += 6 * scale;
+    }
+}
+
 static bool button_pressed(void)
 {
     bool high = gpio_get_level(BUTTON_GPIO);
@@ -276,11 +293,11 @@ static void led_set(bool on)
 #endif
 }
 
-static int load_high_score(void)
+static int load_high_score_from_namespace(const char *nvs_namespace)
 {
     nvs_handle_t nvs;
     int32_t high_score = 0;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+    esp_err_t err = nvs_open(nvs_namespace, NVS_READONLY, &nvs);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         return 0;
     }
@@ -299,6 +316,15 @@ static int load_high_score(void)
         return 0;
     }
     return high_score > 0 ? high_score : 0;
+}
+
+static int load_high_score(void)
+{
+    int high_score = load_high_score_from_namespace(NVS_NAMESPACE);
+    if (high_score == 0) {
+        high_score = load_high_score_from_namespace(NVS_LEGACY_NAMESPACE);
+    }
+    return high_score;
 }
 
 static void save_high_score(int high_score)
@@ -420,7 +446,8 @@ static void draw_game(const game_t *g, int64_t now_us)
     }
 
     if (!g->started) {
-        text(37, 14, "HIP DASH");
+        text(19, 10, "LAURA");
+        text(40, 22, "DINO RUN");
         text(24, 34, "PRESS BUTTON");
         char high_score[16];
         snprintf(high_score, sizeof(high_score), "HI %d", g->high_score);
@@ -454,6 +481,67 @@ static void draw_game(const game_t *g, int64_t now_us)
         rect(18, 17, 92, 29);
         text(36, 22, "GAME OVER");
         text(35, 34, "PRESS BTN");
+    }
+
+    oled_flush();
+}
+
+static void draw_splash(int64_t elapsed_us)
+{
+    oled_clear();
+
+    int frame = (int)(elapsed_us / 33000);
+    int reveal = (int)(elapsed_us / 70000);
+    if (reveal > 96) {
+        reveal = 96;
+    }
+
+    rect(0, 0, 128, 64);
+    rect(3, 3, 122, 58);
+
+    for (int i = 0; i < 20; i++) {
+        int x = (i * 37 + frame * (2 + (i % 3))) & 127;
+        int y = 7 + ((i * 17 + frame * 3) % 30);
+        px(x, y, true);
+        if ((i + frame) % 4 == 0) {
+            px(x + 1, y, true);
+        }
+    }
+
+    for (int i = 0; i < 8; i++) {
+        int x = 127 - ((frame * 5 + i * 23) % 150);
+        int y = 9 + i * 5;
+        line_h(x, y, 10 + (i % 3) * 4);
+    }
+
+    line_h(0, 55, 128);
+    for (int x = 0; x < 128; x += 7) {
+        px(x, 58 + ((x + frame) % 3), true);
+    }
+
+    int dino_x = -18 + (frame * 2);
+    if (dino_x > 18) {
+        dino_x = 18;
+    }
+    draw_dino(dino_x, 45, (frame / 4) % 2);
+
+    int comet_x = 102 - ((frame * 3) % 42);
+    px(comet_x, 10, true);
+    line_h(comet_x + 2, 10, 9);
+    line_h(comet_x + 5, 11, 5);
+
+    if (reveal > 0) {
+        text_scaled(34, 12, "LAURA", 2);
+        if (reveal < 60) {
+            fill_rect(34 + reveal, 12, 80 - reveal, 15);
+        }
+    }
+    if (elapsed_us > 950000) {
+        text_scaled(16, 31, "DINO RUN", 2);
+    }
+
+    if ((frame / 8) % 2 == 0 && elapsed_us > 2100000) {
+        text(37, 49, "GET READY");
     }
 
     oled_flush();
@@ -530,6 +618,8 @@ void app_main(void)
 
     bool last_button = button_pressed();
     int64_t last_us = esp_timer_get_time();
+    int64_t splash_start_us = last_us;
+    bool splash_done = false;
 
     while (true) {
         int64_t now_us = esp_timer_get_time();
@@ -544,6 +634,21 @@ void app_main(void)
         bool current_button = button_pressed();
         bool jump_edge = current_button && !last_button;
         last_button = current_button;
+
+        if (!splash_done) {
+            int64_t splash_elapsed = now_us - splash_start_us;
+            if (splash_elapsed < SPLASH_DURATION_US) {
+                if (!oled_ready && (now_us / 1000000) != ((now_us - dt_ms * 1000LL) / 1000000)) {
+                    oled_ready = oled_init() == ESP_OK;
+                }
+                draw_splash(splash_elapsed);
+                led_set(((now_us / 90000) % 2) == 0);
+                vTaskDelay(pdMS_TO_TICKS(33));
+                continue;
+            }
+            splash_done = true;
+            last_button = current_button;
+        }
 
         game_step(&game, jump_edge, dt_ms);
 

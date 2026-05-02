@@ -1,4 +1,4 @@
-menu "Hip Dash hardware"
+menu "Laura Dino Run hardware"
 
 config HIP_I2C_SDA_GPIO
     int "OLED I2C SDA GPIO"
