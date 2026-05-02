@@ -26,7 +26,7 @@
 #define OLED_COL_OFFSET CONFIG_HIP_OLED_COLUMN_OFFSET
 #define BUTTON_GPIO CONFIG_HIP_BUTTON_GPIO
 #define BUTTON_LED_GPIO CONFIG_HIP_BUTTON_LED_GPIO
-#define SPLASH_DURATION_US 3200000LL
+#define SPLASH_DURATION_US 4800000LL
 
 static const char *TAG = "laura_dino_run";
 static const char *NVS_NAMESPACE = "laura_dino_run";
@@ -39,9 +39,9 @@ static bool oled_ready;
 
 enum {
     PLAYER_X = 18,
-    PLAYER_W = 12,
-    PLAYER_H = 10,
-    PLAYER_GROUND_Y100 = 4500,
+    PLAYER_W = 14,
+    PLAYER_H = 12,
+    PLAYER_GROUND_Y100 = 4300,
 };
 
 typedef struct {
@@ -180,28 +180,32 @@ static void draw_dino(int x, int y, bool run_frame)
 {
     static const char *frames[2][PLAYER_H] = {
         {
-            ".......####.",
-            "......######",
-            "......##.#..",
-            "..#...#####.",
-            ".########...",
-            "#########...",
-            "########....",
-            ".##..##.....",
-            ".#....##....",
-            "##.....#....",
+            "........####..",
+            ".......######.",
+            ".......##.###.",
+            ".......######.",
+            "...#..#####...",
+            "..#########...",
+            ".##########...",
+            "##########....",
+            "#########.....",
+            "..###..###....",
+            "..##....##....",
+            ".##......##...",
         },
         {
-            ".......####.",
-            "......######",
-            "......##.#..",
-            "..#...#####.",
-            ".########...",
-            "#########...",
-            "########....",
-            ".##..##.....",
-            "##....#.....",
-            ".#....##....",
+            "........####..",
+            ".......######.",
+            ".......##.###.",
+            ".......######.",
+            "...#..#####...",
+            "..#########...",
+            ".##########...",
+            "##########....",
+            "#########.....",
+            "..###..##.....",
+            ".##.....###...",
+            "##........##..",
         },
     };
 
@@ -210,6 +214,49 @@ static void draw_dino(int x, int y, bool run_frame)
         for (int xx = 0; xx < PLAYER_W; xx++) {
             if (sprite[yy][xx] == '#') {
                 px(x + xx, y + yy, true);
+            }
+        }
+    }
+}
+
+static void draw_dino_scaled(int x, int y, int scale, bool run_frame)
+{
+    static const char *frames[2][PLAYER_H] = {
+        {
+            "........####..",
+            ".......######.",
+            ".......##.###.",
+            ".......######.",
+            "...#..#####...",
+            "..#########...",
+            ".##########...",
+            "##########....",
+            "#########.....",
+            "..###..###....",
+            "..##....##....",
+            ".##......##...",
+        },
+        {
+            "........####..",
+            ".......######.",
+            ".......##.###.",
+            ".......######.",
+            "...#..#####...",
+            "..#########...",
+            ".##########...",
+            "##########....",
+            "#########.....",
+            "..###..##.....",
+            ".##.....###...",
+            "##........##..",
+        },
+    };
+
+    const char **sprite = frames[run_frame ? 1 : 0];
+    for (int yy = 0; yy < PLAYER_H; yy++) {
+        for (int xx = 0; xx < PLAYER_W; xx++) {
+            if (sprite[yy][xx] == '#') {
+                fill_rect(x + xx * scale, y + yy * scale, scale, scale);
             }
         }
     }
@@ -466,7 +513,7 @@ static void draw_game(const game_t *g, int64_t now_us)
 
     int player_y = g->player_y100 / 100;
     bool running = g->alive && g->player_y100 >= PLAYER_GROUND_Y100;
-    bool run_frame = running && ((now_us / 130000) % 2 == 0);
+    bool run_frame = running && ((now_us / 95000) % 2 == 0);
     draw_dino(PLAYER_X, player_y, run_frame);
 
     for (int i = 0; i < 3; i++) {
@@ -491,7 +538,7 @@ static void draw_splash(int64_t elapsed_us)
     oled_clear();
 
     int frame = (int)(elapsed_us / 33000);
-    int reveal = (int)(elapsed_us / 70000);
+    int reveal = (int)(elapsed_us / 40000);
     if (reveal > 96) {
         reveal = 96;
     }
@@ -514,16 +561,16 @@ static void draw_splash(int64_t elapsed_us)
         line_h(x, y, 10 + (i % 3) * 4);
     }
 
-    line_h(0, 55, 128);
+    line_h(0, 61, 128);
     for (int x = 0; x < 128; x += 7) {
         px(x, 58 + ((x + frame) % 3), true);
     }
 
-    int dino_x = -18 + (frame * 2);
-    if (dino_x > 18) {
-        dino_x = 18;
+    int dino_x = -31 + (frame * 2);
+    if (dino_x > 12) {
+        dino_x = 12;
     }
-    draw_dino(dino_x, 45, (frame / 4) % 2);
+    draw_dino_scaled(dino_x, 36, 2, (frame / 3) % 2);
 
     int comet_x = 102 - ((frame * 3) % 42);
     px(comet_x, 10, true);
@@ -536,11 +583,11 @@ static void draw_splash(int64_t elapsed_us)
             fill_rect(34 + reveal, 12, 80 - reveal, 15);
         }
     }
-    if (elapsed_us > 950000) {
-        text_scaled(16, 31, "DINO RUN", 2);
+    if (elapsed_us > 1700000) {
+        text_scaled(16, 22, "DINO RUN", 2);
     }
 
-    if ((frame / 8) % 2 == 0 && elapsed_us > 2100000) {
+    if ((frame / 8) % 2 == 0 && elapsed_us > 3300000) {
         text(37, 49, "GET READY");
     }
 
