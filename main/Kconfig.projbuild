@@ -29,10 +29,11 @@ config HIP_OLED_COLUMN_OFFSET
 
 config HIP_BUTTON_GPIO
     int "Jump button GPIO"
-    default 9
-    range 0 30
+    default 6
+    range 0 6
     help
-        GPIO connected to the button input. The firmware enables the internal pull-up.
+        GPIO connected to the button input. ESP32-C5 deep-sleep wakeup only works on RTCIO pins GPIO 0..6.
+        The firmware enables the internal pull-up when active-low mode is selected.
 
 config HIP_BUTTON_ACTIVE_LOW
     bool "Button connects GPIO to GND when pressed"

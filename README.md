@@ -13,6 +13,13 @@ Das Projekt ist ein ESP-IDF-Projekt ohne externe Libraries. Das OLED wird direkt
 - Beim Einschalten laeuft ein animierter Splash Screen.
 - Ein kurzer Tastendruck startet das Spiel.
 - Jeder Tastendruck laesst die Spielfigur springen.
+- Ein langer Tastendruck im Startscreen oder nach Game Over oeffnet das Menue.
+- Im Menue geht ein kurzer Tastendruck zum naechsten Eintrag, ein langer Tastendruck bestaetigt.
+- Der Menuepunkt `OFF` schaltet OLED und ESP32-C5 in Deep Sleep.
+- Ein weiterer Tastendruck weckt den ESP32-C5 wieder auf.
+- Unter `Games` gibt es `Laura Dino Run` und `Tiny Copter`.
+- In `Tiny Copter` fliegt der Hubschrauber beim Gedrueckthalten hoch und faellt beim Loslassen runter.
+- Highscores werden getrennt pro Spiel und Schwierigkeit gespeichert.
 - Hindernisse kommen von rechts nach links.
 - Wenn die Figur ein Hindernis beruehrt, erscheint `GAME OVER`.
 - Danach startet ein weiterer Tastendruck neu.
@@ -27,10 +34,11 @@ Diese Werte sind nur Startwerte und muessen eventuell zu deinem ESP32-C5-Board p
 | --- | ---: |
 | OLED SDA | 4 |
 | OLED SCL | 5 |
-| Button | 9 |
+| Button | 6 |
 | Button LED | 8 |
 
 Der Button ist standardmaessig `active low`: eine Seite an GPIO, die andere an GND. Der interne Pull-up wird aktiviert.
+Fuer Deep Sleep Wakeup muss der Button auf einem RTCIO-Pin des ESP32-C5 liegen. Praktisch sind GPIO `0..6`; GPIO `9` funktioniert als normaler Button, kann den ESP32-C5 aber nicht aus Deep Sleep wecken.
 
 ## OLED
 

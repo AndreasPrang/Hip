@@ -5,14 +5,17 @@
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "driver/rtc_io.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "tiny_copter.h"
 
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
@@ -27,6 +30,9 @@
 #define BUTTON_GPIO CONFIG_HIP_BUTTON_GPIO
 #define BUTTON_LED_GPIO CONFIG_HIP_BUTTON_LED_GPIO
 #define SPLASH_DURATION_US 4800000LL
+#define LONG_PRESS_SLEEP_US 1600000LL
+#define MENU_CONFIRM_US 900000LL
+#define SLEEP_RELEASE_STABLE_US 1800000LL
 
 static const char *TAG = "laura_dino_run";
 static const char *NVS_NAMESPACE = "laura_dino_run";
@@ -44,10 +50,31 @@ enum {
     PLAYER_GROUND_Y100 = 4300,
 };
 
+typedef enum {
+    GAME_LAURA_DINO_RUN,
+    GAME_TINY_COPTER,
+} selected_game_t;
+
+typedef enum {
+    MENU_MAIN,
+    MENU_GAMES,
+    MENU_DIFFICULTY,
+} menu_screen_t;
+
+typedef struct {
+    bool open;
+    menu_screen_t screen;
+    int selected;
+    difficulty_t difficulty;
+    selected_game_t selected_game;
+    bool long_press_handled;
+} menu_t;
+
 typedef struct {
     int x;
     int w;
     int h;
+    int type;
     bool scored;
 } obstacle_t;
 
@@ -60,6 +87,7 @@ typedef struct {
     bool alive;
     bool started;
     bool high_score_saved;
+    difficulty_t difficulty;
     obstacle_t obstacles[3];
 } game_t;
 
@@ -77,6 +105,38 @@ static esp_err_t oled_write(uint8_t control, const uint8_t *data, size_t len)
 static esp_err_t oled_cmd(uint8_t cmd)
 {
     return oled_write(0x00, &cmd, 1);
+}
+
+static void oled_clear(void);
+static void oled_flush(void);
+static void rect(int x, int y, int w, int h);
+static void text(int x, int y, const char *s);
+
+static void oled_power_off(void)
+{
+    if (oled_ready) {
+        oled_clear();
+        oled_flush();
+        oled_cmd(0xAE);
+    }
+}
+
+static void draw_sleep_notice(void)
+{
+    oled_clear();
+    rect(20, 17, 88, 30);
+    text(49, 23, "SLEEP");
+    text(34, 35, "RELEASE");
+    oled_flush();
+}
+
+static void draw_sleep_error(void)
+{
+    oled_clear();
+    rect(16, 15, 96, 34);
+    text(40, 21, "NO WAKE");
+    text(37, 34, "GPIO 0 6");
+    oled_flush();
 }
 
 static bool i2c_probe(uint8_t address)
@@ -340,7 +400,83 @@ static void led_set(bool on)
 #endif
 }
 
-static int load_high_score_from_namespace(const char *nvs_namespace)
+static void enter_deep_sleep(void)
+{
+    if (!rtc_gpio_is_valid_gpio(BUTTON_GPIO)) {
+        ESP_LOGE(TAG, "GPIO %d cannot wake ESP32-C5 from deep sleep. Use GPIO 0..6.", BUTTON_GPIO);
+        draw_sleep_error();
+        led_set(false);
+        vTaskDelay(pdMS_TO_TICKS(1800));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Display off. Release button to enter deep sleep.");
+    draw_sleep_notice();
+    led_set(true);
+    vTaskDelay(pdMS_TO_TICKS(450));
+    oled_power_off();
+    led_set(false);
+
+    ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+
+    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+#if CONFIG_HIP_BUTTON_ACTIVE_LOW
+    gpio_pullup_en(BUTTON_GPIO);
+    gpio_pulldown_dis(BUTTON_GPIO);
+    ESP_ERROR_CHECK(gpio_sleep_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY));
+#else
+    gpio_pullup_dis(BUTTON_GPIO);
+    gpio_pulldown_en(BUTTON_GPIO);
+    ESP_ERROR_CHECK(gpio_sleep_set_pull_mode(BUTTON_GPIO, GPIO_PULLDOWN_ONLY));
+#endif
+    ESP_ERROR_CHECK(gpio_sleep_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT));
+    ESP_ERROR_CHECK(gpio_sleep_sel_en(BUTTON_GPIO));
+
+    int64_t released_since_us = 0;
+    while (released_since_us == 0 || esp_timer_get_time() - released_since_us < SLEEP_RELEASE_STABLE_US) {
+        if (button_pressed()) {
+            released_since_us = 0;
+        } else if (released_since_us == 0) {
+            released_since_us = esp_timer_get_time();
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    ESP_LOGI(TAG, "Entering deep sleep. Wakeup: button GPIO %d", BUTTON_GPIO);
+#if CONFIG_HIP_BUTTON_ACTIVE_LOW
+    esp_err_t wake_err = esp_deep_sleep_enable_gpio_wakeup(1ULL << BUTTON_GPIO, ESP_GPIO_WAKEUP_GPIO_LOW);
+#else
+    esp_err_t wake_err = esp_deep_sleep_enable_gpio_wakeup(1ULL << BUTTON_GPIO, ESP_GPIO_WAKEUP_GPIO_HIGH);
+#endif
+    if (wake_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable button wakeup: %s", esp_err_to_name(wake_err));
+        return;
+    }
+
+    esp_deep_sleep_start();
+}
+
+static const char *difficulty_key_suffix(difficulty_t difficulty)
+{
+    switch (difficulty) {
+    case DIFFICULTY_EASY:
+        return "easy";
+    case DIFFICULTY_HARD:
+        return "hard";
+    case DIFFICULTY_NORMAL:
+    default:
+        return "normal";
+    }
+}
+
+static void high_score_key(char *key, size_t key_size, selected_game_t game, difficulty_t difficulty)
+{
+    snprintf(key, key_size, "%s_%s",
+             game == GAME_TINY_COPTER ? "copter" : "dino",
+             difficulty_key_suffix(difficulty));
+}
+
+static int load_high_score_key_from_namespace(const char *nvs_namespace, const char *key)
 {
     nvs_handle_t nvs;
     int32_t high_score = 0;
@@ -353,7 +489,7 @@ static int load_high_score_from_namespace(const char *nvs_namespace)
         return 0;
     }
 
-    err = nvs_get_i32(nvs, NVS_HIGH_SCORE_KEY, &high_score);
+    err = nvs_get_i32(nvs, key, &high_score);
     nvs_close(nvs);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         return 0;
@@ -365,25 +501,38 @@ static int load_high_score_from_namespace(const char *nvs_namespace)
     return high_score > 0 ? high_score : 0;
 }
 
-static int load_high_score(void)
+static int load_legacy_high_score(void)
 {
-    int high_score = load_high_score_from_namespace(NVS_NAMESPACE);
+    int high_score = load_high_score_key_from_namespace(NVS_NAMESPACE, NVS_HIGH_SCORE_KEY);
     if (high_score == 0) {
-        high_score = load_high_score_from_namespace(NVS_LEGACY_NAMESPACE);
+        high_score = load_high_score_key_from_namespace(NVS_LEGACY_NAMESPACE, NVS_HIGH_SCORE_KEY);
     }
     return high_score;
 }
 
-static void save_high_score(int high_score)
+static int load_high_score(selected_game_t game, difficulty_t difficulty)
+{
+    char key[16];
+    high_score_key(key, sizeof(key), game, difficulty);
+    int high_score = load_high_score_key_from_namespace(NVS_NAMESPACE, key);
+    if (high_score == 0 && game == GAME_LAURA_DINO_RUN && difficulty == DIFFICULTY_HARD) {
+        high_score = load_legacy_high_score();
+    }
+    return high_score;
+}
+
+static void save_high_score(selected_game_t game, difficulty_t difficulty, int high_score)
 {
     nvs_handle_t nvs;
+    char key[16];
+    high_score_key(key, sizeof(key), game, difficulty);
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to open NVS to save high score: %s", esp_err_to_name(err));
         return;
     }
 
-    err = nvs_set_i32(nvs, NVS_HIGH_SCORE_KEY, high_score);
+    err = nvs_set_i32(nvs, key, high_score);
     if (err == ESP_OK) {
         err = nvs_commit(nvs);
     }
@@ -396,19 +545,78 @@ static void save_high_score(int high_score)
 
 static void spawn_obstacle(game_t *g, int i, int base_x)
 {
+    uint32_t random = esp_random();
     g->obstacles[i].x = base_x + (int)(esp_random() % 28);
-    g->obstacles[i].w = 5 + (int)(esp_random() % 5);
-    g->obstacles[i].h = 8 + (int)(esp_random() % 14);
+    g->obstacles[i].type = (int)(random % 4);
+    switch (g->obstacles[i].type) {
+    case 0: // small cactus
+        g->obstacles[i].w = 7;
+        g->obstacles[i].h = 12 + (int)((random >> 4) % 8);
+        break;
+    case 1: // rock
+        g->obstacles[i].w = 8;
+        g->obstacles[i].h = 7 + (int)((random >> 5) % 4);
+        break;
+    case 2: // crystal
+        g->obstacles[i].w = 7;
+        g->obstacles[i].h = 11 + (int)((random >> 6) % 6);
+        break;
+    default: // stump
+        g->obstacles[i].w = 9;
+        g->obstacles[i].h = 8 + (int)((random >> 7) % 5);
+        break;
+    }
     g->obstacles[i].scored = false;
+}
+
+static int difficulty_start_speed(difficulty_t difficulty)
+{
+    switch (difficulty) {
+    case DIFFICULTY_EASY:
+        return 7400;
+    case DIFFICULTY_HARD:
+        return 9500;
+    case DIFFICULTY_NORMAL:
+    default:
+        return 8500;
+    }
+}
+
+static int difficulty_speed_limit(difficulty_t difficulty)
+{
+    switch (difficulty) {
+    case DIFFICULTY_EASY:
+        return 12500;
+    case DIFFICULTY_HARD:
+        return 15500;
+    case DIFFICULTY_NORMAL:
+    default:
+        return 14000;
+    }
+}
+
+static int difficulty_speed_step(difficulty_t difficulty)
+{
+    switch (difficulty) {
+    case DIFFICULTY_EASY:
+        return 140;
+    case DIFFICULTY_HARD:
+        return 220;
+    case DIFFICULTY_NORMAL:
+    default:
+        return 180;
+    }
 }
 
 static void game_reset(game_t *g)
 {
     int high_score = g->high_score;
+    difficulty_t difficulty = g->difficulty;
     memset(g, 0, sizeof(*g));
     g->high_score = high_score;
+    g->difficulty = difficulty;
     g->player_y100 = PLAYER_GROUND_Y100;
-    g->speed100 = 9500;
+    g->speed100 = difficulty_start_speed(difficulty);
     g->alive = true;
     g->started = true;
     spawn_obstacle(g, 0, 148);
@@ -454,8 +662,8 @@ static void game_step(game_t *g, bool jump_edge, int dt_ms)
         if (!o->scored && o->x + o->w < 18) {
             o->scored = true;
             g->score++;
-            if (g->speed100 < 15500) {
-                g->speed100 += 220;
+            if (g->speed100 < difficulty_speed_limit(g->difficulty)) {
+                g->speed100 += difficulty_speed_step(g->difficulty);
             }
         }
         if (o->x + o->w < 0) {
@@ -476,7 +684,7 @@ static void game_step(game_t *g, bool jump_edge, int dt_ms)
             if (!g->high_score_saved && g->score > g->high_score) {
                 g->high_score = g->score;
                 g->high_score_saved = true;
-                save_high_score(g->high_score);
+                save_high_score(GAME_LAURA_DINO_RUN, g->difficulty, g->high_score);
                 ESP_LOGI(TAG, "New high score: %d", g->high_score);
             }
         }
@@ -519,15 +727,233 @@ static void draw_game(const game_t *g, int64_t now_us)
     for (int i = 0; i < 3; i++) {
         const obstacle_t *o = &g->obstacles[i];
         int oy = 54 - o->h;
-        fill_rect(o->x, oy, o->w, o->h);
-        px(o->x, oy - 1, true);
-        px(o->x + o->w - 1, oy - 1, true);
+        switch (o->type) {
+        case 0:
+            fill_rect(o->x + 3, oy, 2, o->h);
+            fill_rect(o->x + 1, oy + 5, 2, 5);
+            fill_rect(o->x + 5, oy + 3, 2, 6);
+            px(o->x + 2, oy + 4, true);
+            px(o->x + 5, oy + 2, true);
+            break;
+        case 1:
+            fill_rect(o->x + 1, oy + 2, o->w - 2, o->h - 2);
+            line_h(o->x + 2, oy + 1, o->w - 4);
+            line_h(o->x, oy + 4, o->w);
+            px(o->x + 2, oy + o->h, true);
+            px(o->x + o->w - 3, oy + o->h, true);
+            break;
+        case 2:
+            line_h(o->x + 3, oy, 1);
+            line_h(o->x + 2, oy + 1, 3);
+            fill_rect(o->x + 1, oy + 3, 5, o->h - 5);
+            line_h(o->x, oy + o->h - 2, 7);
+            px(o->x + 3, oy + 2, false);
+            px(o->x + 2, oy + 6, false);
+            break;
+        default:
+            fill_rect(o->x + 1, oy, o->w - 2, o->h);
+            line_h(o->x, oy + 1, o->w);
+            px(o->x + 3, oy + 2, false);
+            px(o->x + 6, oy + 4, false);
+            line_h(o->x + 2, oy + o->h - 3, o->w - 4);
+            break;
+        }
     }
 
     if (!g->alive) {
         rect(18, 17, 92, 29);
         text(36, 22, "GAME OVER");
         text(35, 34, "PRESS BTN");
+    }
+
+    oled_flush();
+}
+
+static int menu_item_count(menu_screen_t screen)
+{
+    switch (screen) {
+    case MENU_GAMES:
+        return 2;
+    case MENU_DIFFICULTY:
+        return 4;
+    case MENU_MAIN:
+    default:
+        return 4;
+    }
+}
+
+static const char *difficulty_name(difficulty_t difficulty)
+{
+    switch (difficulty) {
+    case DIFFICULTY_EASY:
+        return "EASY";
+    case DIFFICULTY_HARD:
+        return "HARD";
+    case DIFFICULTY_NORMAL:
+    default:
+        return "NORMAL";
+    }
+}
+
+static const char *menu_item_label(const menu_t *menu, int index)
+{
+    static char label[24];
+
+    if (menu->screen == MENU_GAMES) {
+        snprintf(label, sizeof(label), "%s %s",
+                 index == 0 && menu->selected_game == GAME_LAURA_DINO_RUN ? "*" :
+                 index == 1 && menu->selected_game == GAME_TINY_COPTER ? "*" : " ",
+                 index == 0 ? "DINO RUN" : "TINY COPTER");
+        return label;
+    }
+
+    if (menu->screen == MENU_DIFFICULTY) {
+        switch (index) {
+        case 0:
+            return "BACK";
+        case 1:
+            return "EASY";
+        case 2:
+            return "NORMAL";
+        default:
+            return "HARD";
+        }
+    }
+
+    switch (index) {
+    case 0:
+        return "BACK";
+    case 1:
+        return "OFF";
+    case 2:
+        return "GAMES";
+    default:
+        snprintf(label, sizeof(label), "DIFFICULTY %s", difficulty_name(menu->difficulty));
+        return label;
+    }
+}
+
+static void menu_open(menu_t *menu)
+{
+    menu->open = true;
+    menu->screen = MENU_MAIN;
+    menu->selected = 0;
+    menu->long_press_handled = true;
+}
+
+static void return_to_selected_game(const menu_t *menu, game_t *dino, tiny_copter_t *copter)
+{
+    if (menu->selected_game == GAME_TINY_COPTER) {
+        int high_score = load_high_score(GAME_TINY_COPTER, menu->difficulty);
+        tiny_copter_init(copter, high_score, menu->difficulty);
+        return;
+    }
+
+    int high_score = load_high_score(GAME_LAURA_DINO_RUN, menu->difficulty);
+    memset(dino, 0, sizeof(*dino));
+    dino->high_score = high_score;
+    dino->difficulty = menu->difficulty;
+    dino->player_y100 = PLAYER_GROUND_Y100;
+    dino->alive = true;
+    dino->started = false;
+}
+
+static void menu_confirm(menu_t *menu, game_t *dino, tiny_copter_t *copter)
+{
+    if (menu->screen == MENU_MAIN) {
+        switch (menu->selected) {
+        case 0:
+            return_to_selected_game(menu, dino, copter);
+            menu->open = false;
+            return;
+        case 1:
+            enter_deep_sleep();
+            return;
+        case 2:
+            menu->screen = MENU_GAMES;
+            menu->selected = 0;
+            return;
+        default:
+            menu->screen = MENU_DIFFICULTY;
+            menu->selected = 0;
+            return;
+        }
+    }
+
+    if (menu->screen == MENU_GAMES) {
+        if (menu->selected == 0) {
+            menu->selected_game = GAME_LAURA_DINO_RUN;
+            dino->high_score = load_high_score(GAME_LAURA_DINO_RUN, menu->difficulty);
+            dino->difficulty = menu->difficulty;
+            menu->open = false;
+            game_reset(dino);
+        } else {
+            menu->selected_game = GAME_TINY_COPTER;
+            copter->high_score = load_high_score(GAME_TINY_COPTER, menu->difficulty);
+            copter->difficulty = menu->difficulty;
+            menu->open = false;
+            tiny_copter_reset(copter);
+        }
+        return;
+    }
+
+    switch (menu->selected) {
+    case 0:
+        menu->screen = MENU_MAIN;
+        menu->selected = 3;
+        break;
+    case 1:
+        menu->difficulty = DIFFICULTY_EASY;
+        dino->difficulty = menu->difficulty;
+        dino->high_score = load_high_score(GAME_LAURA_DINO_RUN, menu->difficulty);
+        copter->difficulty = menu->difficulty;
+        copter->high_score = load_high_score(GAME_TINY_COPTER, menu->difficulty);
+        menu->screen = MENU_MAIN;
+        menu->selected = 3;
+        break;
+    case 2:
+        menu->difficulty = DIFFICULTY_NORMAL;
+        dino->difficulty = menu->difficulty;
+        dino->high_score = load_high_score(GAME_LAURA_DINO_RUN, menu->difficulty);
+        copter->difficulty = menu->difficulty;
+        copter->high_score = load_high_score(GAME_TINY_COPTER, menu->difficulty);
+        menu->screen = MENU_MAIN;
+        menu->selected = 3;
+        break;
+    default:
+        menu->difficulty = DIFFICULTY_HARD;
+        dino->difficulty = menu->difficulty;
+        dino->high_score = load_high_score(GAME_LAURA_DINO_RUN, menu->difficulty);
+        copter->difficulty = menu->difficulty;
+        copter->high_score = load_high_score(GAME_TINY_COPTER, menu->difficulty);
+        menu->screen = MENU_MAIN;
+        menu->selected = 3;
+        break;
+    }
+}
+
+static void draw_menu(const menu_t *menu)
+{
+    oled_clear();
+    rect(0, 0, 128, 64);
+
+    if (menu->screen == MENU_GAMES) {
+        text(47, 4, "GAMES");
+    } else if (menu->screen == MENU_DIFFICULTY) {
+        text(32, 4, "DIFFICULTY");
+    } else {
+        text(35, 4, "MENU");
+    }
+
+    int count = menu_item_count(menu->screen);
+    for (int i = 0; i < count; i++) {
+        int y = 18 + i * 11;
+        if (i == menu->selected) {
+            rect(5, y - 3, 118, 12);
+            fill_rect(7, y - 1, 4, 8);
+            text(8, y, ">");
+        }
+        text(20, y, menu_item_label(menu, i));
     }
 
     oled_flush();
@@ -657,15 +1083,35 @@ void app_main(void)
 
     game_t game = {
         .player_y100 = PLAYER_GROUND_Y100,
-        .high_score = load_high_score(),
+        .high_score = load_high_score(GAME_LAURA_DINO_RUN, DIFFICULTY_NORMAL),
+        .difficulty = DIFFICULTY_NORMAL,
         .alive = true,
         .started = false,
+    };
+    tiny_copter_t copter;
+    tiny_copter_init(&copter, load_high_score(GAME_TINY_COPTER, DIFFICULTY_NORMAL), DIFFICULTY_NORMAL);
+    menu_t menu = {
+        .open = true,
+        .screen = MENU_GAMES,
+        .difficulty = DIFFICULTY_NORMAL,
+        .selected_game = GAME_LAURA_DINO_RUN,
+        .long_press_handled = true,
+    };
+    const tiny_draw_api_t tiny_draw = {
+        .px = px,
+        .line_h = line_h,
+        .fill_rect = fill_rect,
+        .rect = rect,
+        .text = text,
+        .clear = oled_clear,
+        .flush = oled_flush,
     };
     ESP_LOGI(TAG, "High score: %d", game.high_score);
 
     bool last_button = button_pressed();
     int64_t last_us = esp_timer_get_time();
     int64_t splash_start_us = last_us;
+    int64_t button_down_start_us = last_button ? last_us : 0;
     bool splash_done = false;
 
     while (true) {
@@ -680,7 +1126,16 @@ void app_main(void)
 
         bool current_button = button_pressed();
         bool jump_edge = current_button && !last_button;
+        bool release_edge = !current_button && last_button;
+        int64_t press_duration_us = button_down_start_us != 0 ? now_us - button_down_start_us : 0;
         last_button = current_button;
+        if (current_button) {
+            if (button_down_start_us == 0) {
+                button_down_start_us = now_us;
+            }
+        } else {
+            button_down_start_us = 0;
+        }
 
         if (!splash_done) {
             int64_t splash_elapsed = now_us - splash_start_us;
@@ -695,9 +1150,67 @@ void app_main(void)
             }
             splash_done = true;
             last_button = current_button;
+            button_down_start_us = current_button ? now_us : 0;
         }
 
-        game_step(&game, jump_edge, dt_ms);
+        if (menu.open) {
+            if (release_edge) {
+                if (press_duration_us < MENU_CONFIRM_US) {
+                    menu.selected = (menu.selected + 1) % menu_item_count(menu.screen);
+                }
+                menu.long_press_handled = false;
+            }
+            if (current_button && button_down_start_us != 0 &&
+                now_us - button_down_start_us >= MENU_CONFIRM_US && !menu.long_press_handled) {
+                if (menu.screen == MENU_MAIN && menu.selected == 1 &&
+                    now_us - button_down_start_us < LONG_PRESS_SLEEP_US) {
+                    draw_menu(&menu);
+                    led_set(current_button);
+                    vTaskDelay(pdMS_TO_TICKS(33));
+                    continue;
+                }
+                menu.long_press_handled = true;
+                menu_confirm(&menu, &game, &copter);
+                if (!menu.open && current_button) {
+                    button_down_start_us = now_us;
+                }
+            }
+
+            if (menu.open) {
+                draw_menu(&menu);
+                led_set(current_button);
+                vTaskDelay(pdMS_TO_TICKS(33));
+                continue;
+            }
+        }
+
+        bool active_started = menu.selected_game == GAME_TINY_COPTER ? copter.started : game.started;
+        bool active_alive = menu.selected_game == GAME_TINY_COPTER ? copter.alive : game.alive;
+        bool can_open_menu = menu.selected_game == GAME_TINY_COPTER ? !active_alive : (!active_started || !active_alive);
+        if (can_open_menu && current_button && button_down_start_us != 0 &&
+            now_us - button_down_start_us >= LONG_PRESS_SLEEP_US) {
+            menu_open(&menu);
+            draw_menu(&menu);
+            led_set(true);
+            vTaskDelay(pdMS_TO_TICKS(33));
+            continue;
+        }
+
+        bool game_button_edge = jump_edge;
+        if (menu.selected_game != GAME_TINY_COPTER && can_open_menu) {
+            game_button_edge = release_edge && press_duration_us < LONG_PRESS_SLEEP_US;
+        }
+
+        if (menu.selected_game == GAME_TINY_COPTER) {
+            tiny_copter_step(&copter, current_button, game_button_edge, dt_ms);
+            if (copter.high_score_saved) {
+                save_high_score(GAME_TINY_COPTER, copter.difficulty, copter.high_score);
+                ESP_LOGI(TAG, "New Tiny Copter high score: %d", copter.high_score);
+                copter.high_score_saved = false;
+            }
+        } else {
+            game_step(&game, game_button_edge, dt_ms);
+        }
 
         if (!oled_ready && (now_us / 1000000) != ((now_us - dt_ms * 1000LL) / 1000000)) {
             oled_ready = oled_init() == ESP_OK;
@@ -706,10 +1219,16 @@ void app_main(void)
             }
         }
 
-        draw_game(&game, now_us);
+        if (menu.selected_game == GAME_TINY_COPTER) {
+            tiny_copter_draw(&copter, &tiny_draw, now_us);
+        } else {
+            draw_game(&game, now_us);
+        }
 
-        bool airborne = game.started && game.alive && game.player_y100 < PLAYER_GROUND_Y100;
-        bool game_over_blink = game.started && !game.alive && ((now_us / 180000) % 2 == 0);
+        bool airborne = menu.selected_game == GAME_TINY_COPTER
+            ? (copter.started && copter.alive && current_button)
+            : (game.started && game.alive && game.player_y100 < PLAYER_GROUND_Y100);
+        bool game_over_blink = (active_started && !active_alive && ((now_us / 180000) % 2 == 0));
         bool oled_missing_blink = !oled_ready && ((now_us / 250000) % 2 == 0);
         led_set(current_button || airborne || game_over_blink || oled_missing_blink);
 
