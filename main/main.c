@@ -4,13 +4,15 @@
 #include <string.h>
 
 #include "driver/gpio.h"
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
@@ -26,7 +28,11 @@
 #define BUTTON_LED_GPIO CONFIG_HIP_BUTTON_LED_GPIO
 
 static const char *TAG = "hip_dash";
+static const char *NVS_NAMESPACE = "hip_dash";
+static const char *NVS_HIGH_SCORE_KEY = "high_score";
 static uint8_t fb[OLED_WIDTH * OLED_PAGES];
+static i2c_master_bus_handle_t i2c_bus;
+static i2c_master_dev_handle_t oled_dev;
 static bool oled_ready;
 
 enum {
@@ -48,24 +54,22 @@ typedef struct {
     int player_vy100;
     int speed100;
     int score;
+    int high_score;
     bool alive;
     bool started;
+    bool high_score_saved;
     obstacle_t obstacles[3];
 } game_t;
 
 static esp_err_t oled_write(uint8_t control, const uint8_t *data, size_t len)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (OLED_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, control, true);
-    if (len > 0) {
-        i2c_master_write(cmd, data, len, true);
+    if (oled_dev == NULL || len > 16) {
+        return ESP_ERR_INVALID_ARG;
     }
-    i2c_master_stop(cmd);
-    esp_err_t err = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    return err;
+
+    uint8_t tx[17] = { control };
+    memcpy(&tx[1], data, len);
+    return i2c_master_transmit(oled_dev, tx, len + 1, 100);
 }
 
 static esp_err_t oled_cmd(uint8_t cmd)
@@ -75,13 +79,7 @@ static esp_err_t oled_cmd(uint8_t cmd)
 
 static bool i2c_probe(uint8_t address)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (address << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_stop(cmd);
-    esp_err_t err = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(30));
-    i2c_cmd_link_delete(cmd);
-    return err == ESP_OK;
+    return i2c_bus != NULL && i2c_master_probe(i2c_bus, address, 30) == ESP_OK;
 }
 
 static void i2c_scan(void)
@@ -278,6 +276,51 @@ static void led_set(bool on)
 #endif
 }
 
+static int load_high_score(void)
+{
+    nvs_handle_t nvs;
+    int32_t high_score = 0;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return 0;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS for high score: %s", esp_err_to_name(err));
+        return 0;
+    }
+
+    err = nvs_get_i32(nvs, NVS_HIGH_SCORE_KEY, &high_score);
+    nvs_close(nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return 0;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read high score: %s", esp_err_to_name(err));
+        return 0;
+    }
+    return high_score > 0 ? high_score : 0;
+}
+
+static void save_high_score(int high_score)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS to save high score: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_set_i32(nvs, NVS_HIGH_SCORE_KEY, high_score);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save high score: %s", esp_err_to_name(err));
+    }
+}
+
 static void spawn_obstacle(game_t *g, int i, int base_x)
 {
     g->obstacles[i].x = base_x + (int)(esp_random() % 28);
@@ -288,7 +331,9 @@ static void spawn_obstacle(game_t *g, int i, int base_x)
 
 static void game_reset(game_t *g)
 {
+    int high_score = g->high_score;
     memset(g, 0, sizeof(*g));
+    g->high_score = high_score;
     g->player_y100 = PLAYER_GROUND_Y100;
     g->speed100 = 9500;
     g->alive = true;
@@ -355,6 +400,12 @@ static void game_step(game_t *g, bool jump_edge, int dt_ms)
         bool hit_y = player_y < oy + o->h && player_y + PLAYER_H > oy;
         if (hit_x && hit_y) {
             g->alive = false;
+            if (!g->high_score_saved && g->score > g->high_score) {
+                g->high_score = g->score;
+                g->high_score_saved = true;
+                save_high_score(g->high_score);
+                ESP_LOGI(TAG, "New high score: %d", g->high_score);
+            }
         }
     }
 }
@@ -371,6 +422,9 @@ static void draw_game(const game_t *g, int64_t now_us)
     if (!g->started) {
         text(37, 14, "HIP DASH");
         text(24, 34, "PRESS BUTTON");
+        char high_score[16];
+        snprintf(high_score, sizeof(high_score), "HI %d", g->high_score);
+        text(47, 46, high_score);
         oled_flush();
         return;
     }
@@ -378,6 +432,10 @@ static void draw_game(const game_t *g, int64_t now_us)
     char score[16];
     snprintf(score, sizeof(score), "%d", g->score);
     text(2, 2, score);
+
+    char high_score[16];
+    snprintf(high_score, sizeof(high_score), "HI %d", g->high_score);
+    text(82, 2, high_score);
 
     int player_y = g->player_y100 / 100;
     bool running = g->alive && g->player_y100 >= PLAYER_GROUND_Y100;
@@ -424,17 +482,22 @@ static void hardware_init(void)
     led_set(false);
 #endif
 
-    i2c_config_t i2c_conf = {
-        .mode = I2C_MODE_MASTER,
+    i2c_master_bus_config_t i2c_conf = {
+        .i2c_port = I2C_PORT,
         .sda_io_num = SDA_GPIO,
         .scl_io_num = SCL_GPIO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
-        .clk_flags = 0,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &i2c_conf));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT, I2C_MODE_MASTER, 0, 0, 0));
+    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_conf, &i2c_bus));
+
+    i2c_device_config_t oled_i2c_conf = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = OLED_ADDR,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &oled_i2c_conf, &oled_dev));
 
     ESP_LOGI(TAG, "OLED config: SDA GPIO %d, SCL GPIO %d, address 0x%02X, column offset %d",
              SDA_GPIO, SCL_GPIO, OLED_ADDR, OLED_COL_OFFSET);
@@ -448,13 +511,22 @@ static void hardware_init(void)
 
 void app_main(void)
 {
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+
     hardware_init();
 
     game_t game = {
         .player_y100 = PLAYER_GROUND_Y100,
+        .high_score = load_high_score(),
         .alive = true,
         .started = false,
     };
+    ESP_LOGI(TAG, "High score: %d", game.high_score);
 
     bool last_button = button_pressed();
     int64_t last_us = esp_timer_get_time();

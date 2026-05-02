@@ -15,6 +15,7 @@ Das Projekt ist ein ESP-IDF-Projekt ohne externe Libraries. Das OLED wird direkt
 - Hindernisse kommen von rechts nach links.
 - Wenn die Figur ein Hindernis beruehrt, erscheint `GAME OVER`.
 - Danach startet ein weiterer Tastendruck neu.
+- Der Highscore wird im NVS-Speicher des ESP32-C5 gespeichert und bleibt nach Reset/Power-Off erhalten.
 - Die Button-LED leuchtet beim Druecken, beim Springen und blinkt nach Game Over.
 
 ## Standard-Pins
@@ -83,5 +84,4 @@ Hip Dash hardware
 
 - Sound/Buzzer fuer Sprung und Kollision
 - mehrere Hindernisformen
-- Highscore im NVS-Speicher
 - Kalibrierbarer Schwierigkeitsgrad
